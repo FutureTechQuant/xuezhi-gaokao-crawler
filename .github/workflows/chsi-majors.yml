@@ -34,35 +34,57 @@ jobs:
           cache: "pip"
 
       - name: Install dependencies
+        shell: bash
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
       - name: Install Playwright browsers
+        shell: bash
         run: |
           python -m playwright install --with-deps chromium
 
       - name: Run CHSI majors crawler
         id: run-crawler
-        continue-on-error: true
+        shell: bash
         run: |
+          echo "===== pwd ====="
+          pwd
+          echo "===== before run ====="
+          find . -maxdepth 3 -type d | sort || true
+
           python scripts/chsi/majors.py
+
+          echo "===== after run ====="
+          find output -maxdepth 3 -type f | sort || true
 
       - name: Check output files
         id: check-output
         shell: bash
         run: |
-          if [ -d data/chsi-major ] && [ "$(find data/chsi-major -type f | wc -l)" -gt 0 ]; then
-            file_count=$(find data/chsi-major -type f | wc -l | tr -d ' ')
+          echo "===== inspect output ====="
+          ls -la || true
+          ls -la output || true
+          find output -type f | sort || true
+
+          if [ -d output ] && [ "$(find output -type f | wc -l)" -gt 0 ]; then
+            file_count=$(find output -type f | wc -l | tr -d ' ')
             echo "status=success" >> "$GITHUB_OUTPUT"
             echo "file_count=$file_count" >> "$GITHUB_OUTPUT"
-            echo "✅ Found $file_count output files in data/chsi-major"
+            echo "✅ Found $file_count output files"
           else
             echo "status=no_file" >> "$GITHUB_OUTPUT"
             echo "file_count=0" >> "$GITHUB_OUTPUT"
-            echo "⚠️ data/chsi-major directory not found or empty"
+            echo "❌ output/ directory not found or empty"
             exit 1
           fi
+
+      - name: Sync output to data/chsi-major
+        if: steps.check-output.outputs.status == 'success'
+        shell: bash
+        run: |
+          mkdir -p data/chsi-major
+          rsync -av --delete output/ data/chsi-major/
 
       - name: Show changed files
         if: steps.check-output.outputs.status == 'success'
@@ -71,8 +93,8 @@ jobs:
           echo "===== git status ====="
           git status --short || true
           echo
-          echo "===== generated files ====="
-          find data/chsi-major -maxdepth 2 -type f | sort || true
+          echo "===== synced files ====="
+          find data/chsi-major -maxdepth 3 -type f | sort || true
 
       - name: Configure git
         if: steps.check-output.outputs.status == 'success'
@@ -100,7 +122,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: chsi-majors-output
-          path: data/chsi-major/
+          path: output/
           if-no-files-found: warn
           retention-days: 7
           overwrite: true
