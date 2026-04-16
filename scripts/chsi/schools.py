@@ -454,9 +454,11 @@ def run() -> None:
             page_size = 20
             last_start = 2900  # From ai/10_target_sites.md
             starts = list(range(0, last_start + page_size, page_size))
-            max_pages = 10  # Limit for testing
+            # Remove testing limit - process all pages
+            total_pages = len(starts)
+            print(f"[INFO] Will process {total_pages} pages (0 to {last_start})")
 
-            for idx, start in enumerate(starts[:max_pages], start=1):
+            for idx, start in enumerate(starts, start=1):
                 page_url = BASE_URL_PATTERN.format(start=start)
                 print(f"[INFO] Loading page {idx}: {page_url}")
 
