@@ -20,7 +20,7 @@ from playwright.sync_api import sync_playwright
 # ============================================================================
 
 BASE_URL = "https://gaokao.chsi.com.cn/zyk/zybk/"
-OUTPUT_DIR = Path("data/chsi-major")
+OUTPUT_DIR = Path("output")
 LEVEL_NAMES = ["本科（普通教育）", "本科（职业教育）", "高职（专科）"]
 
 SAVE_DEBUG = os.getenv("SAVE_DEBUG", "0") == "1"
