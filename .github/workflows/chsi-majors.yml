@@ -2,6 +2,12 @@ name: CHSI Majors Crawler
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - "scripts/chsi/majors.py"
+      - ".github/workflows/chsi-majors.yml"
 
 permissions:
   contents: write
@@ -46,24 +52,17 @@ jobs:
         id: check-output
         shell: bash
         run: |
-          if [ -d output ] && [ "$(find output -type f | wc -l)" -gt 0 ]; then
-            file_count=$(find output -type f | wc -l | tr -d ' ')
+          if [ -d data/chsi-major ] && [ "$(find data/chsi-major -type f | wc -l)" -gt 0 ]; then
+            file_count=$(find data/chsi-major -type f | wc -l | tr -d ' ')
             echo "status=success" >> "$GITHUB_OUTPUT"
             echo "file_count=$file_count" >> "$GITHUB_OUTPUT"
-            echo "✅ Found $file_count output files"
+            echo "✅ Found $file_count output files in data/chsi-major"
           else
             echo "status=no_file" >> "$GITHUB_OUTPUT"
             echo "file_count=0" >> "$GITHUB_OUTPUT"
-            echo "⚠️ output/ directory not found or empty"
+            echo "⚠️ data/chsi-major directory not found or empty"
             exit 1
           fi
-
-      - name: Sync output to data/chsi-zyk
-        if: steps.check-output.outputs.status == 'success'
-        shell: bash
-        run: |
-          mkdir -p data/chsi-zyk
-          rsync -av --delete output/ data/chsi-zyk/
 
       - name: Show changed files
         if: steps.check-output.outputs.status == 'success'
@@ -72,8 +71,8 @@ jobs:
           echo "===== git status ====="
           git status --short || true
           echo
-          echo "===== synced files ====="
-          find data/chsi-zyk -maxdepth 2 -type f | sort || true
+          echo "===== generated files ====="
+          find data/chsi-major -maxdepth 2 -type f | sort || true
 
       - name: Configure git
         if: steps.check-output.outputs.status == 'success'
@@ -86,7 +85,7 @@ jobs:
         if: steps.check-output.outputs.status == 'success'
         shell: bash
         run: |
-          git add -f data/chsi-zyk/
+          git add -f data/chsi-major/
 
           if git diff --staged --quiet; then
             echo "No changes to commit"
@@ -101,7 +100,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: chsi-majors-output
-          path: output/
+          path: data/chsi-major/
           if-no-files-found: warn
           retention-days: 7
           overwrite: true
