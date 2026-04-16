@@ -86,7 +86,7 @@ jobs:
         if: steps.check-output.outputs.status == 'success'
         shell: bash
         run: |
-          git add data/chsi-zyk/
+          git add -f data/chsi-zyk/
 
           if git diff --staged --quiet; then
             echo "No changes to commit"
