@@ -138,7 +138,7 @@ Rules:
 
 You MUST align with the current project stack:
 
-- Python 3.13
+- Python 3.12
 - Playwright as the primary browser automation tool
 - Parsing tools may include:
   - `re`
@@ -296,7 +296,7 @@ You MUST explicitly mention the risk and adjust the strategy instead of blindly 
 
 From `ai/02_coding_style.md`:
 
-- Use Python 3.13 syntax
+- Use Python 3.12 syntax
 - Use type hints
 - Public functions must have docstrings
 - One function should do one thing when possible

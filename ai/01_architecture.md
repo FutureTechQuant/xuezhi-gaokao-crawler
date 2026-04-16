@@ -6,7 +6,7 @@
 - 学职平台（XZ）：采集专业信息、职业信息
 
 ## 技术选型
-- Python 3.13
+- Python 3.12
 - Playwright
 - 结构化解析：re / lxml / BeautifulSoup（按页面需要选用）
 - 输出格式：JSON

@@ -1,7 +1,7 @@
 # 代码规范
 
 ## 基本要求
-- 使用 Python 3.13 语法
+- 使用 Python 3.12 语法
 - 使用 type hints
 - 公共函数必须有 docstring
 - 单个函数尽量只做一件事

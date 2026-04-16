@@ -6,6 +6,7 @@
 - 设计 CHSI（阳光高考）与 XZ（学职平台）双站点采集流程
 - 将采集结果结构化输出为 JSON
 - 基于业务拆分多个 GitHub Actions
+- 不同的 GitHub Actions 根据其代码位置，在代码被触发时自动提交
 - 保障脚本可在 GitHub Actions 中稳定运行并自动回写仓库
 
 ## 必须遵守
