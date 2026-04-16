@@ -1,0 +1,819 @@
+"""
+CHSI Majors Crawler - Specification-driven implementation
+Stages: 1. List extraction → 2. Detail extraction → 3. Normalization → 4. Automation
+"""
+
+import json
+import os
+import re
+from copy import deepcopy
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import parse_qs, urljoin, urlparse
+
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+from playwright.sync_api import sync_playwright
+
+# ============================================================================
+# Configuration
+# ============================================================================
+
+BASE_URL = "https://gaokao.chsi.com.cn/zyk/zybk/"
+OUTPUT_DIR = Path("output")
+LEVEL_NAMES = ["本科（普通教育）", "本科（职业教育）", "高职（专科）"]
+
+SAVE_DEBUG = os.getenv("SAVE_DEBUG", "0") == "1"
+SCRAPE_DETAILS = os.getenv("SCRAPE_DETAILS", "1") == "1"
+SCRAPE_SCHOOLS = os.getenv("SCRAPE_SCHOOLS", "1") == "1"
+
+# Navigation blacklist for link parsing
+NAV_BLACKLIST = {
+    "首页", "高考资讯", "阳光志愿", "高招咨询", "招生动态", "试题评析", "院校库", "专业库",
+    "院校满意度", "专业满意度", "专业推荐", "更多", "招生政策", "选科参考", "云咨询周",
+    "成绩查询", "招生章程", "名单公示", "志愿参考", "咨询室", "录取结果", "高职招生",
+    "工作动态", "心理测评", "直播安排", "批次线", "专业解读", "各地网站", "职业前景",
+    "特殊类型招生", "志愿填报时间", "招办访谈", "登录", "注册", "搜索", "查看", "取消",
+    "基本信息", "开设院校", "开设课程", "图解专业", "选科要求", "更多>"
+}
+
+SECTION_ORDER = [
+    "专业介绍", "统计信息", "相近专业", "本专业推荐人数较多的高校",
+    "该专业学生考研方向", "已毕业人员从业方向", "薪酬指数",
+]
+
+SATISFACTION_LABELS = ["综合满意度", "办学条件满意度", "教学质量满意度", "就业满意度"]
+SCHOOL_NAME_RE = re.compile(
+    r"(大学|学院|学校|职业大学|职业学院|高等专科学校|师范大学|师范学院|医学院|中医药大学)$"
+)
+
+# ============================================================================
+# Utilities
+# ============================================================================
+
+def ensure_output() -> None:
+    """Create output directory if it doesn't exist."""
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def iso_now() -> str:
+    """Return current time in ISO format with timezone."""
+    return datetime.now(timezone.utc).astimezone().isoformat()
+
+
+def clean_text(text: Any) -> str:
+    """Clean and normalize text."""
+    if text is None:
+        return ""
+    return " ".join(str(text).split()).strip()
+
+
+def normalize_lines(text: str) -> List[str]:
+    """Split text into lines and clean each."""
+    return [clean_text(x) for x in (text or "").splitlines() if clean_text(x)]
+
+
+def unique_keep_order(items: List[Any]) -> List[Any]:
+    """Remove duplicates while preserving order."""
+    seen = set()
+    out = []
+    for item in items:
+        key = json.dumps(item, ensure_ascii=False, sort_keys=True) \
+            if isinstance(item, (dict, list)) else item
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(item)
+    return out
+
+
+def save_json(path: Path, data: Any) -> None:
+    """Save data as JSON file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def save_debug(page: Any, name: str) -> None:
+    """Save debug screenshot and HTML if SAVE_DEBUG is enabled."""
+    if not SAVE_DEBUG:
+        return
+    try:
+        page.screenshot(path=str(OUTPUT_DIR / f"{name}.png"), full_page=True)
+    except Exception:
+        pass
+    try:
+        (OUTPUT_DIR / f"{name}.html").write_text(page.content(), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def write_partial(flat_majors: List[Dict]) -> None:
+    """Write partial results to enable recovery on failure."""
+    save_json(
+        OUTPUT_DIR / "majors-flat.partial.json",
+        {
+            "抓取时间": iso_now(),
+            "来源": BASE_URL,
+            "数量": len(flat_majors),
+            "专业列表": flat_majors,
+        },
+    )
+
+
+# ============================================================================
+# Stage 1: List Extraction
+# ============================================================================
+
+def wait_ready(page: Any) -> None:
+    """Wait for list page to load with all required elements."""
+    page.goto(BASE_URL, wait_until="domcontentloaded", timeout=60000)
+    page.wait_for_selector("#app", timeout=30000)
+    page.wait_for_function(
+        """() => {
+            const t = document.body ? document.body.innerText : '';
+            return t.includes('专业知识库')
+                && t.includes('本科（普通教育）专业目录')
+                && t.includes('本科（职业教育）专业目录')
+                && t.includes('高职（专科）专业目录');
+        }""",
+        timeout=60000,
+    )
+    page.wait_for_selector(".index-cc-list", timeout=30000)
+    page.wait_for_timeout(1200)
+
+
+def wait_table(page: Any) -> None:
+    """Wait for table rows to appear and loading to complete."""
+    page.wait_for_selector(".zyk-table-con .ivu-table-body tbody tr", timeout=30000)
+    page.wait_for_function(
+        """() => {
+            const rows = document.querySelectorAll('.zyk-table-con .ivu-table-body tbody tr');
+            if (!rows.length) return false;
+            const loading = document.querySelector('.ivu-spin-spinning') 
+                         || document.querySelector('.ivu-spin-show-text');
+            return !loading;
+        }""",
+        timeout=30000,
+    )
+    page.wait_for_timeout(600)
+
+
+def get_level_texts(page: Any) -> List[str]:
+    """Extract all education level names from list page."""
+    items = page.locator(".index-cc-list li")
+    out = []
+    for i in range(items.count()):
+        txt = clean_text(items.nth(i).inner_text())
+        if txt:
+            out.append(txt)
+    return out
+
+
+def click_level_by_text(page: Any, level_name: str) -> None:
+    """Click education level by name."""
+    items = page.locator(".index-cc-list li")
+    for i in range(items.count()):
+        item = items.nth(i)
+        txt = clean_text(item.inner_text())
+        if txt == level_name:
+            item.click()
+            page.wait_for_timeout(1000)
+            return
+    raise RuntimeError(f"未找到培养层次：{level_name}")
+
+
+def get_group(page: Any, idx: int) -> Any:
+    """Get group selector by index (discipline or major class)."""
+    return page.locator(".spec-list .zyk-lb-ul-con").nth(idx)
+
+
+def get_group_items_texts(group: Any) -> List[str]:
+    """Extract all item texts from group."""
+    items = group.locator("ul.zyk-lb-ul > li")
+    out = []
+    for i in range(items.count()):
+        txt = clean_text(items.nth(i).inner_text())
+        if txt:
+            out.append(txt)
+    return out
+
+
+def click_group_item_by_text(group: Any, text: str) -> None:
+    """Click group item by text."""
+    items = group.locator("ul.zyk-lb-ul > li")
+    for i in range(items.count()):
+        item = items.nth(i)
+        txt = clean_text(item.inner_text())
+        if txt == text:
+            item.click()
+            return
+    raise RuntimeError(f"未找到分组项：{text}")
+
+
+def extract_spec_id(detail_href: str, school_href: str) -> str:
+    """Extract specId from detail or school URLs."""
+    for url in [detail_href, school_href]:
+        if not url:
+            continue
+        m = re.search(r"specId=(\d+)", url)
+        if m:
+            return m.group(1)
+        m = re.search(r"/detail/(\d+)", url)
+        if m:
+            return m.group(1)
+    return ""
+
+
+def extract_table_rows(
+    page: Any, level_name: str, discipline: str, major_class: str
+) -> List[Dict]:
+    """Extract table rows from current page (Stage 1 base fields only)."""
+    row_data = page.locator(".zyk-table-con .ivu-table-body tbody tr").evaluate_all(
+        """rows => rows.map(tr => {
+            const tds = Array.from(tr.querySelectorAll('td'));
+            const majorA = tds[0]?.querySelector('a');
+            const schoolA = tds[2]?.querySelector('a');
+            return {
+                cell_count: tds.length,
+                major_name: (tds[0]?.innerText || '').trim(),
+                major_code: (tds[1]?.innerText || '').trim(),
+                school_text: (tds[2]?.innerText || '').trim(),
+                satisfaction: (tds[3]?.innerText || '').trim(),
+                detail_href: majorA?.getAttribute('href') || '',
+                school_href: schoolA?.getAttribute('href') || '',
+            };
+        })"""
+    )
+
+    rows = []
+    for item in row_data:
+        if item.get("cell_count", 0) < 4:
+            continue
+
+        major_name = clean_text(item.get("major_name", ""))
+        major_code = clean_text(item.get("major_code", ""))
+        school_text = clean_text(item.get("school_text", ""))
+        satisfaction = clean_text(item.get("satisfaction", ""))
+
+        if not major_name or "暂无" in major_name:
+            continue
+
+        detail_href = urljoin(BASE_URL, item.get("detail_href", "")) \
+            if item.get("detail_href") else ""
+        school_href = urljoin(BASE_URL, item.get("school_href", "")) \
+            if item.get("school_href") else ""
+
+        spec_id = extract_spec_id(detail_href, school_href)
+        if not school_href and spec_id:
+            school_href = f"https://gaokao.chsi.com.cn/zyk/zybk/ksyxPage?specId={spec_id}"
+
+        rows.append({
+            "培养层次": level_name,
+            "门类": discipline,
+            "专业类": major_class,
+            "专业名称": major_name,
+            "专业代码": major_code,
+            "专业满意度": satisfaction,
+            "开设院校文本": school_text,
+            "详情页": detail_href,
+            "开设院校页": school_href,
+            "specId": spec_id,
+        })
+
+    return rows
+
+
+# ============================================================================
+# Stage 2: Detail Extraction
+# ============================================================================
+
+def find_title_and_level(lines: List[str]) -> Tuple[str, str]:
+    """Find major title and education level from page text."""
+    for i, line in enumerate(lines):
+        if line in LEVEL_NAMES:
+            title = lines[i - 1] if i > 0 else ""
+            return title, line
+    return "", ""
+
+
+def parse_field(text: str, label: str) -> str:
+    """Parse labeled field from text."""
+    m = re.search(rf"{re.escape(label)}[:：]\s*([^\n]+)", text)
+    return clean_text(m.group(1)) if m else ""
+
+
+def extract_section(lines: List[str], heading: str, all_headings: List[str]) -> Dict:
+    """Extract content section between two headings."""
+    try:
+        start = lines.index(heading)
+    except ValueError:
+        return {"raw_text": "", "lines": []}
+
+    end = len(lines)
+    for i in range(start + 1, len(lines)):
+        if lines[i] in all_headings:
+            end = i
+            break
+
+    content_lines = lines[start + 1:end]
+    return {
+        "raw_text": "\n".join(content_lines).strip(),
+        "lines": content_lines,
+    }
+
+
+def parse_data_cutoff(text: str) -> str:
+    """Parse data statistics cutoff date."""
+    m = re.search(r"数据统计截止日期[:：]\s*([^\n]+)", text)
+    return clean_text(m.group(1)) if m else ""
+
+
+def parse_graduates_scale(lines: List[str]) -> str:
+    """Parse nationwide college graduate scale."""
+    for i, line in enumerate(lines):
+        if "全国普通高校毕业生规模" in line:
+            if i + 1 < len(lines):
+                return clean_text(lines[i + 1])
+    return ""
+
+
+def parse_satisfaction_items(text: str) -> Dict:
+    """Parse satisfaction statistics."""
+    result = {}
+    for label in SATISFACTION_LABELS:
+        m = re.search(rf"{re.escape(label)}\s*([0-9.]+)\s*([0-9]+人)", text, re.S)
+        result[label] = {
+            "评分": clean_text(m.group(1)) if m else "",
+            "人数": clean_text(m.group(2)) if m else "",
+        }
+    return result
+
+
+def parse_links_from_page(page: Any) -> Tuple[Dict, List[Dict]]:
+    """Parse important links from detail page."""
+    anchors = page.locator("a")
+    links = {
+        "基本信息": "",
+        "开设院校": "",
+        "开设课程": "",
+        "专业解读": "",
+        "图解专业": "",
+        "选科要求": "",
+    }
+    other_links = []
+
+    for i in range(anchors.count()):
+        a = anchors.nth(i)
+        text = clean_text(a.inner_text())
+        href = a.get_attribute("href") or ""
+        if not text or not href:
+            continue
+
+        full = urljoin(page.url, href)
+        if text in links and not links[text]:
+            links[text] = full
+        elif text not in NAV_BLACKLIST:
+            other_links.append({"名称": text, "链接": full})
+
+    return links, unique_keep_order(other_links)
+
+
+def parse_nearby_majors(page: Any, current_spec_id: str) -> List[Dict]:
+    """Parse nearby major links."""
+    anchors = page.locator("a")
+    items = []
+    for i in range(anchors.count()):
+        a = anchors.nth(i)
+        text = clean_text(a.inner_text())
+        href = a.get_attribute("href") or ""
+        if not text or not href:
+            continue
+        full = urljoin(page.url, href)
+        if "/zyk/zybk/detail/" not in full:
+            continue
+        sid = ""
+        m = re.search(r"/detail/(\d+)", full)
+        if m:
+            sid = m.group(1)
+        if sid and sid == current_spec_id:
+            continue
+        items.append({"名称": text, "链接": full, "specId": sid})
+    return unique_keep_order(items)
+
+
+def parse_postgraduate_links(page: Any) -> List[Dict]:
+    """Parse postgraduate direction links."""
+    anchors = page.locator("a")
+    items = []
+    for i in range(anchors.count()):
+        a = anchors.nth(i)
+        text = clean_text(a.inner_text())
+        href = a.get_attribute("href") or ""
+        if not text or not href:
+            continue
+        full = urljoin(page.url, href)
+        if "yz.chsi.com.cn/zyk/specialityDetail.do" in full:
+            parsed = urlparse(full)
+            qs = parse_qs(parsed.query)
+            items.append({
+                "名称": text,
+                "链接": full,
+                "专业代码": qs.get("zydm", [""])[0],
+                "层次键": qs.get("cckey", [""])[0],
+            })
+    return unique_keep_order(items)
+
+
+def parse_recommended_schools(section_lines: List[str]) -> List[Dict]:
+    """Parse recommended schools with satisfaction and count."""
+    schools = []
+    i = 0
+    while i < len(section_lines):
+        name = section_lines[i]
+        if SCHOOL_NAME_RE.search(name):
+            score = section_lines[i + 1] if i + 1 < len(section_lines) else ""
+            count = section_lines[i + 2] if i + 2 < len(section_lines) else ""
+            if re.fullmatch(r"[0-9.]+", clean_text(score)) and \
+               re.fullmatch(r"\d+人", clean_text(count)):
+                schools.append({
+                    "学校名称": name,
+                    "评分": clean_text(score),
+                    "人数": clean_text(count),
+                })
+                i += 3
+                continue
+        i += 1
+    return schools
+
+
+def parse_employment_directions(section_lines: List[str]) -> List[str]:
+    """Parse employment directions list."""
+    raw = "".join(section_lines).strip()
+    if not raw:
+        return []
+    parts = re.split(r"[、，,；;\s]+", raw)
+    return [x for x in [clean_text(p) for p in parts] if x]
+
+
+def extract_detail(context: Any, major_row: Dict) -> Dict:
+    """Extract detail page content (Stage 2)."""
+    if not major_row["详情页"]:
+        return {
+            "error": "missing_detail_url",
+            "抓取时间": iso_now(),
+        }
+
+    current_spec_id = major_row.get("specId", "")
+    detail_page = context.new_page()
+    try:
+        detail_page.goto(major_row["详情页"], wait_until="domcontentloaded", timeout=60000)
+        detail_page.wait_for_timeout(1500)
+        text = detail_page.locator("body").inner_text(timeout=30000)
+        lines = normalize_lines(text)
+
+        title_guess, level_guess = find_title_and_level(lines)
+        code = parse_field(text, "专业代码")
+        discipline = parse_field(text, "门类")
+        major_class = parse_field(text, "专业类")
+
+        link_map, other_links = parse_links_from_page(detail_page)
+
+        section_map = {}
+        for heading in SECTION_ORDER:
+            section_map[heading] = extract_section(lines, heading, SECTION_ORDER)
+
+        stats_lines = section_map["统计信息"]["lines"]
+        salary_lines = section_map["薪酬指数"]["lines"]
+
+        detail = {
+            "标题": title_guess or major_row.get("专业名称", ""),
+            "培养层次": level_guess or major_row.get("培养层次", ""),
+            "专业代码": code or major_row.get("专业代码", ""),
+            "门类": discipline or major_row.get("门类", ""),
+            "专业类": major_class or major_row.get("专业类", ""),
+            "链接": {
+                "详情页": major_row["详情页"],
+                "基本信息": link_map.get("基本信息", major_row["详情页"]),
+                "开设院校": link_map.get("开设院校", major_row.get("开设院校页", "")),
+                "开设课程": link_map.get("开设课程", ""),
+                "专业解读": link_map.get("专业解读", ""),
+                "图解专业": link_map.get("图解专业", ""),
+                "选科要求": link_map.get("选科要求", ""),
+            },
+            "专业介绍": section_map["专业介绍"]["raw_text"],
+            "统计信息": {
+                "数据统计截止日期": parse_data_cutoff(section_map["统计信息"]["raw_text"]),
+                "全国普通高校毕业生规模": parse_graduates_scale(stats_lines),
+                "专业满意度": parse_satisfaction_items(section_map["统计信息"]["raw_text"] + "\n" + text),
+                "原始文本": section_map["统计信息"]["raw_text"],
+            },
+            "相近专业": parse_nearby_majors(detail_page, current_spec_id),
+            "本专业推荐人数较多的高校": {
+                "原始文本": section_map["本专业推荐人数较多的高校"]["raw_text"],
+                "学校列表": parse_recommended_schools(section_map["本专业推荐人数较多的高校"]["lines"]),
+            },
+            "考研方向": parse_postgraduate_links(detail_page),
+            "已毕业人员从业方向": {
+                "原始文本": section_map["已毕业人员从业方向"]["raw_text"],
+                "列表": parse_employment_directions(section_map["已毕业人员从业方向"]["lines"]),
+            },
+            "薪酬指数": {
+                "原始文本": section_map["薪酬指数"]["raw_text"],
+                "列表": salary_lines,
+            },
+            "其他链接": other_links,
+            "抓取时间": iso_now(),
+        }
+        return detail
+    except Exception as e:
+        return {
+            "error": repr(e),
+            "详情页": major_row["详情页"],
+            "抓取时间": iso_now(),
+        }
+    finally:
+        detail_page.close()
+
+
+def extract_school_rows(context: Any, major_row: Dict) -> Dict:
+    """Extract school list from school page."""
+    if not major_row["开设院校页"]:
+        return {
+            "来源页": "",
+            "学校数量": 0,
+            "学校列表": [],
+            "error": "missing_school_url",
+        }
+
+    page = context.new_page()
+    school_rows = []
+    seen = set()
+
+    try:
+        page.goto(major_row["开设院校页"], wait_until="domcontentloaded", timeout=60000)
+        page.wait_for_timeout(1800)
+
+        page_no = 1
+        while True:
+            anchors = page.locator("a")
+            for i in range(anchors.count()):
+                a = anchors.nth(i)
+                text = clean_text(a.inner_text())
+                href = a.get_attribute("href") or ""
+
+                if not text or text in NAV_BLACKLIST:
+                    continue
+                if not SCHOOL_NAME_RE.search(text):
+                    continue
+
+                key = text
+                if key in seen:
+                    continue
+                seen.add(key)
+
+                school_rows.append({
+                    "学校名称": text,
+                    "学校链接": urljoin(page.url, href) if href else "",
+                    "页码": page_no,
+                })
+
+            next_btn = page.locator(".ivu-page-next:not(.ivu-page-disabled)")
+            if next_btn.count() == 0:
+                break
+
+            next_btn.first.click()
+            page.wait_for_timeout(1000)
+            page_no += 1
+
+        return {
+            "来源页": major_row["开设院校页"],
+            "学校数量": len(school_rows),
+            "学校列表": school_rows,
+        }
+    except Exception as e:
+        return {
+            "来源页": major_row["开设院校页"],
+            "学校数量": len(school_rows),
+            "学校列表": school_rows,
+            "error": repr(e),
+        }
+    finally:
+        page.close()
+
+
+# ============================================================================
+# Stage 3: Normalization
+# ============================================================================
+
+def build_hierarchy(levels_data: List[str], flat_rows: List[Dict]) -> List[Dict]:
+    """Build hierarchical structure from flat major rows."""
+    level_map = {}
+
+    for row in flat_rows:
+        level_name = row["培养层次"]
+        discipline_name = row["门类"]
+        class_name = row["专业类"]
+
+        if level_name not in level_map:
+            level_map[level_name] = {
+                "名称": level_name,
+                "门类列表": {}
+            }
+
+        level_obj = level_map[level_name]
+        if discipline_name not in level_obj["门类列表"]:
+            level_obj["门类列表"][discipline_name] = {
+                "门类": discipline_name,
+                "专业类列表": {}
+            }
+
+        discipline_obj = level_obj["门类列表"][discipline_name]
+        if class_name not in discipline_obj["专业类列表"]:
+            discipline_obj["专业类列表"][class_name] = {
+                "专业类": class_name,
+                "专业列表": []
+            }
+
+        major_obj = deepcopy(row)
+        discipline_obj["专业类列表"][class_name]["专业列表"].append(major_obj)
+
+    final_levels = []
+    for level_name in levels_data:
+        if level_name not in level_map:
+            final_levels.append({"名称": level_name, "门类列表": []})
+            continue
+
+        level_obj = level_map[level_name]
+        disciplines = []
+        for discipline_name, discipline_obj in level_obj["门类列表"].items():
+            class_list = []
+            for class_name, class_obj in discipline_obj["专业类列表"].items():
+                class_list.append({
+                    "专业类": class_name,
+                    "专业列表": class_obj["专业列表"]
+                })
+            disciplines.append({
+                "门类": discipline_name,
+                "专业类列表": class_list
+            })
+
+        final_levels.append({
+            "名称": level_name,
+            "门类列表": disciplines
+        })
+
+    return final_levels
+
+
+# ============================================================================
+# Main
+# ============================================================================
+
+def run() -> None:
+    """Main execution: Stages 1-3."""
+    ensure_output()
+
+    flat_majors = []
+    levels_found = []
+    seen_major = set()
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-blink-features=AutomationControlled",
+            ],
+        )
+        context = browser.new_context(
+            viewport={"width": 1440, "height": 900},
+            locale="zh-CN",
+            timezone_id="Asia/Shanghai",
+            user_agent=(
+                "Mozilla/5.0 (X11; Linux x86_64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/123.0.0.0 Safari/537.36"
+            ),
+        )
+        page = context.new_page()
+
+        try:
+            # Stage 1: Navigate and extract list data
+            wait_ready(page)
+            save_debug(page, "01_ready")
+
+            all_level_texts = get_level_texts(page)
+            for level_name in LEVEL_NAMES:
+                if level_name in all_level_texts:
+                    levels_found.append(level_name)
+
+            for level_name in levels_found:
+                print(f"[INFO] Entering level: {level_name}")
+                click_level_by_text(page, level_name)
+
+                discipline_group = get_group(page, 0)
+                class_group = get_group(page, 1)
+                discipline_texts = get_group_items_texts(discipline_group)
+
+                for discipline in discipline_texts:
+                    print(f"[INFO] Entering discipline: {level_name} / {discipline}")
+                    discipline_group = get_group(page, 0)
+                    click_group_item_by_text(discipline_group, discipline)
+                    page.wait_for_timeout(800)
+
+                    class_group = get_group(page, 1)
+                    class_texts = get_group_items_texts(class_group)
+
+                    for major_class in class_texts:
+                        try:
+                            print(f"[INFO] Entering class: {level_name} / {discipline} / {major_class}")
+                            class_group = get_group(page, 1)
+                            click_group_item_by_text(class_group, major_class)
+                            wait_table(page)
+
+                            rows = extract_table_rows(page, level_name, discipline, major_class)
+                            print(f"[INFO] Extracted {len(rows)} rows")
+
+                            for row in rows:
+                                key = row["specId"] or (
+                                    row["培养层次"],
+                                    row["门类"],
+                                    row["专业类"],
+                                    row["专业名称"],
+                                    row["专业代码"],
+                                )
+                                if key in seen_major:
+                                    continue
+                                seen_major.add(key)
+
+                                # Stage 2: Extract detail and school data
+                                if SCRAPE_DETAILS:
+                                    row["详情"] = extract_detail(context, row)
+                                else:
+                                    row["详情"] = {}
+
+                                if SCRAPE_SCHOOLS:
+                                    row["开设院校"] = extract_school_rows(context, row)
+                                else:
+                                    row["开设院校"] = {
+                                        "来源页": row.get("开设院校页", ""),
+                                        "学校数量": 0,
+                                        "学校列表": [],
+                                    }
+
+                                flat_majors.append(row)
+
+                            write_partial(flat_majors)
+
+                        except Exception as e:
+                            print(f"[WARN] Skipping {level_name} / {discipline} / {major_class}: {repr(e)}")
+                            write_partial(flat_majors)
+                            continue
+
+            save_debug(page, "02_done")
+
+        except PlaywrightTimeoutError as e:
+            save_debug(page, "timeout")
+            write_partial(flat_majors)
+            raise e
+        except Exception as e:
+            save_debug(page, "error")
+            write_partial(flat_majors)
+            raise e
+        finally:
+            context.close()
+            browser.close()
+
+    # Stage 3: Normalize and output
+    all_json = {
+        "抓取时间": iso_now(),
+        "来源": BASE_URL,
+        "培养层次列表": build_hierarchy(levels_found, flat_majors),
+    }
+
+    flat_json = {
+        "抓取时间": iso_now(),
+        "来源": BASE_URL,
+        "数量": len(flat_majors),
+        "专业列表": flat_majors,
+    }
+
+    meta_json = {
+        "抓取时间": iso_now(),
+        "来源": BASE_URL,
+        "培养层次": levels_found,
+        "专业总数": len(flat_majors),
+        "是否抓详情": SCRAPE_DETAILS,
+        "是否抓院校": SCRAPE_SCHOOLS,
+    }
+
+    save_json(OUTPUT_DIR / "all.json", all_json)
+    save_json(OUTPUT_DIR / "majors-flat.json", flat_json)
+    save_json(OUTPUT_DIR / "meta.json", meta_json)
+
+    print(f"[DONE] levels={len(levels_found)}, majors={len(flat_majors)}, detail={SCRAPE_DETAILS}, schools={SCRAPE_SCHOOLS}")
+
+
+if __name__ == "__main__":
+    run()

@@ -1,0 +1,107 @@
+name: CHSI Majors Crawler
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  run-chsi-majors:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Install Playwright browsers
+        run: |
+          python -m playwright install --with-deps chromium
+
+      - name: Run CHSI majors crawler
+        id: run-crawler
+        continue-on-error: true
+        run: |
+          python scripts/chsi/majors.py
+
+      - name: Check output files
+        id: check-output
+        shell: bash
+        run: |
+          if [ -d output ] && [ "$(find output -type f | wc -l)" -gt 0 ]; then
+            file_count=$(find output -type f | wc -l | tr -d ' ')
+            echo "status=success" >> "$GITHUB_OUTPUT"
+            echo "file_count=$file_count" >> "$GITHUB_OUTPUT"
+            echo "✅ Found $file_count output files"
+          else
+            echo "status=no_file" >> "$GITHUB_OUTPUT"
+            echo "file_count=0" >> "$GITHUB_OUTPUT"
+            echo "⚠️ output/ directory not found or empty"
+            exit 1
+          fi
+
+      - name: Sync output to data/chsi-zyk
+        if: steps.check-output.outputs.status == 'success'
+        shell: bash
+        run: |
+          mkdir -p data/chsi-zyk
+          rsync -av --delete output/ data/chsi-zyk/
+
+      - name: Show changed files
+        if: steps.check-output.outputs.status == 'success'
+        shell: bash
+        run: |
+          echo "===== git status ====="
+          git status --short || true
+          echo
+          echo "===== synced files ====="
+          find data/chsi-zyk -maxdepth 2 -type f | sort || true
+
+      - name: Configure git
+        if: steps.check-output.outputs.status == 'success'
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Commit and push
+        if: steps.check-output.outputs.status == 'success'
+        shell: bash
+        run: |
+          git add data/chsi-zyk/
+
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "🤖 chsi-majors: $(date +%Y-%m-%d\ %H:%M:%S)"
+            git pull --rebase origin "${GITHUB_REF_NAME}" || true
+            git push origin HEAD:"${GITHUB_REF_NAME}"
+          fi
+
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: chsi-majors-output
+          path: output/
+          if-no-files-found: warn
+          retention-days: 7
+          overwrite: true
