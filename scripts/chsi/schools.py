@@ -115,51 +115,9 @@ def write_partial(flat_schools: List[Dict]) -> None:
 # ============================================================================
 
 def wait_list_ready(page: Any) -> None:
-    """Wait for school list page to load with all required elements."""
-    # More flexible waiting - try multiple selectors and conditions
-    try:
-        # First, wait for basic page load
-        page.wait_for_load_state("domcontentloaded", timeout=30000)
-
-        # Try different main container selectors
-        main_selectors = ["#app", "body", ".container", ".main"]
-        main_found = False
-        for selector in main_selectors:
-            try:
-                page.wait_for_selector(selector, timeout=5000)
-                main_found = True
-                break
-            except:
-                continue
-
-        if not main_found:
-            print("[WARN] No main container found, proceeding anyway")
-
-        # Wait for school-related content
-        content_checks = [
-            lambda: page.locator("text=/院校|学校|大学|学院/").count() > 0,
-            lambda: len(page.locator("a[href*='schschoolInfo']").all()) > 0,
-            lambda: page.locator(".sch-card, .school-item, .card, .school-card").count() > 0,
-        ]
-
-        content_found = False
-        for check in content_checks:
-            try:
-                page.wait_for_function(f"() => {check.__name__}()", timeout=10000)
-                content_found = True
-                break
-            except:
-                continue
-
-        if not content_found:
-            print("[WARN] No school content indicators found, proceeding anyway")
-
-        # Final wait for stability
-        page.wait_for_timeout(2000)
-
-    except Exception as e:
-        print(f"[WARN] Page wait failed: {repr(e)}, proceeding anyway")
-        page.wait_for_timeout(3000)
+    """Wait for school list page to load."""
+    page.wait_for_load_state("domcontentloaded", timeout=30000)
+    page.wait_for_timeout(2000)  # Simple wait like reference implementation
 
 
 def extract_sch_id(detail_href: str) -> str:
@@ -176,164 +134,58 @@ def extract_sch_id(detail_href: str) -> str:
 
 
 def extract_school_cards(page: Any, page_url: str, page_no: int) -> List[Dict]:
-    """Extract school information from card-based list page."""
-    # Try multiple card selectors
-    card_selectors = [
-        ".sch-card", ".school-item", ".card", ".school-card",
-        "[class*='school']", "[class*='card']", ".item"
-    ]
+    """Extract school information from list page using direct link approach."""
+    # Use the proven approach: find links directly
+    cards = page.locator('a[href*="schoolInfo--schId-"]')
+    items = []
+    seen = set()
 
-    cards = None
-    for selector in card_selectors:
+    count = cards.count()
+    print(f"[DEBUG] Found {count} school links on page {page_no}")
+
+    # Get page text hash for debugging
+    try:
+        body_text_hash = hash(page.locator('body').inner_text(timeout=30000))
+    except:
+        body_text_hash = 0
+
+    for i in range(count):
         try:
-            elements = page.locator(selector)
-            if elements.count() > 0:
-                # Additional check: make sure they contain school-like content
-                for i in range(min(elements.count(), 5)):  # Check first 5
-                    text = clean_text(elements.nth(i).inner_text())
-                    if any(keyword in text for keyword in ['大学', '学院', '学校', '师范大学']):
-                        cards = elements
-                        break
-                if cards:
-                    break
-        except Exception:
-            continue
-
-    if not cards or cards.count() == 0:
-        print(f"[WARN] No school cards found on page {page_no}, trying fallback extraction")
-        # Fallback: try to extract from any links containing school info
-        fallback_schools = []
-        try:
-            all_links = page.locator("a[href*='schschoolInfo']")
-            for i in range(min(all_links.count(), 50)):  # Limit to avoid too many
-                link_elem = all_links.nth(i)
-                href = link_elem.get_attribute("href") or ""
-                text = clean_text(link_elem.inner_text())
-
-                if text and any(keyword in text for keyword in ['大学', '学院', '学校']):
-                    sch_id = extract_sch_id(urljoin(page_url, href))
-                    fallback_schools.append({
-                        "学校名称": text,
-                        "schId": sch_id,
-                        "详情页": urljoin(page_url, href),
-                        "学校图片": "",
-                        "主管部门": "",
-                        "院校所在地": "",
-                        "办学层次": "",
-                        "学校类型": "",
-                        "院校满意度": "",
-                        "列表来源页": page_url,
-                        "页码": page_no,
-                    })
-        except Exception as e:
-            print(f"[WARN] Fallback extraction failed: {repr(e)}")
-
-        return fallback_schools
-
-    schools = []
-    for i in range(cards.count()):
-        try:
-            card = cards.nth(i)
-            card_text = clean_text(card.inner_text())
-
-            # Skip if doesn't look like a school
-            if not any(keyword in card_text for keyword in ['大学', '学院', '学校']):
+            a = cards.nth(i)
+            name = clean_text(a.inner_text())
+            href = a.get_attribute('href') or ''
+            if not name or not href:
                 continue
 
-            # Extract school name - try multiple approaches
-            name = ""
-            name_selectors = ["h3", ".school-name", ".name", ".title"]
-            for sel in name_selectors:
-                try:
-                    name_elem = card.locator(sel).first
-                    if name_elem.count() > 0:
-                        name = clean_text(name_elem.inner_text())
-                        if name:
-                            break
-                except:
-                    continue
-
-            # If still no name, try to extract from text
-            if not name:
-                lines = card_text.split('\n')
-                for line in lines:
-                    line = clean_text(line)
-                    if any(keyword in line for keyword in ['大学', '学院', '学校']):
-                        name = line
-                        break
-
-            if not name:
+            detail_url = urljoin(page.url, href)
+            sig = (name, detail_url)
+            if sig in seen:
                 continue
-
-            # Extract detail link
-            detail_href = ""
-            try:
-                link_elem = card.locator("a[href*='schschoolInfo']").first
-                if link_elem.count() > 0:
-                    detail_href = link_elem.get_attribute("href") or ""
-                    detail_href = urljoin(page_url, detail_href)
-            except:
-                pass
+            seen.add(sig)
 
             # Extract schId from URL
-            sch_id = extract_sch_id(detail_href)
+            sch_id = extract_sch_id(detail_url)
 
-            # Extract image
-            img_src = ""
-            try:
-                img_elem = card.locator("img").first
-                if img_elem.count() > 0:
-                    img_src = img_elem.get_attribute("src") or ""
-                    img_src = urljoin(page_url, img_src)
-            except:
-                pass
-
-            # Parse other fields from card text using regex patterns
-            department = ""
-            location = ""
-            level = ""
-            school_type = ""
-            satisfaction = ""
-
-            # Try to extract structured info
-            patterns = {
-                'department': r'(?:主管|隶属|主办)[：:]\s*([^\n]+)',
-                'location': r'(?:所在地|地址)[：:]\s*([^\n]+)',
-                'level': r'(?:办学层次|层次)[：:]\s*([^\n]+)',
-                'school_type': r'(?:学校类型|类型)[：:]\s*([^\n]+)',
-                'satisfaction': r'(\d+(?:\.\d+)?)\s*分?\s*([0-9]+人)?',
-            }
-
-            for field, pattern in patterns.items():
-                m = re.search(pattern, card_text, re.IGNORECASE)
-                if m:
-                    if field == 'satisfaction':
-                        score = m.group(1)
-                        count = m.group(2) if len(m.groups()) > 1 else ""
-                        satisfaction = f"{score}分{count}".strip()
-                    else:
-                        locals()[field] = clean_text(m.group(1))
-
-            if name and (detail_href or sch_id):
-                schools.append({
-                    "学校名称": name,
-                    "schId": sch_id,
-                    "详情页": detail_href,
-                    "学校图片": img_src,
-                    "主管部门": department,
-                    "院校所在地": location,
-                    "办学层次": level,
-                    "学校类型": school_type,
-                    "院校满意度": satisfaction,
-                    "列表来源页": page_url,
-                    "页码": page_no,
-                })
+            items.append({
+                "学校名称": name,
+                "schId": sch_id,
+                "详情页": detail_url,
+                "学校图片": "",  # Will be extracted from detail page
+                "主管部门": "",
+                "院校所在地": "",
+                "办学层次": "",
+                "学校类型": "",
+                "院校满意度": "",
+                "列表来源页": page_url,
+                "页码": page_no,
+                "page_text_hash": body_text_hash,
+            })
 
         except Exception as e:
-            print(f"[WARN] Failed to parse school card {i}: {repr(e)}")
+            print(f"[WARN] Failed to parse school link {i}: {repr(e)}")
             continue
 
-    return schools
+    return items
 
 
 def get_total_pages(page: Any) -> int:
@@ -599,30 +451,29 @@ def run() -> None:
 
         try:
             # Stage 1: Navigate and extract list data
-            start_page = 0
-            page_no = 1
-            max_pages = 5  # Limit for testing, can be increased
+            page_size = 20
+            last_start = 2900  # From ai/10_target_sites.md
+            starts = list(range(0, last_start + page_size, page_size))
+            max_pages = 10  # Limit for testing
 
-            while page_no <= max_pages:
-                page_url = BASE_URL_PATTERN.format(start=start_page)
-                print(f"[INFO] Loading page {page_no}: {page_url}")
+            for idx, start in enumerate(starts[:max_pages], start=1):
+                page_url = BASE_URL_PATTERN.format(start=start)
+                print(f"[INFO] Loading page {idx}: {page_url}")
 
                 page.goto(page_url, wait_until="domcontentloaded", timeout=60000)
+                page.wait_for_timeout(2000)  # Simple wait like reference
                 wait_list_ready(page)
-                save_debug(page, f"01_page_{page_no}")
+                save_debug(page, f"01_page_{idx}")
 
-                schools = extract_school_cards(page, page_url, page_no)
-                print(f"[INFO] Extracted {len(schools)} schools from page {page_no}")
+                schools = extract_school_cards(page, page_url, idx)
+                print(f"[INFO] Extracted {len(schools)} schools from page {idx}")
 
                 if schools:
                     for school in schools[:3]:  # Log first 3 schools for debugging
                         print(f"[DEBUG] Sample school: {school['学校名称']} (schId: {school['schId']})")
 
                 for school in schools:
-                    key = school["schId"] or (
-                        school["学校名称"],
-                        school["详情页"],
-                    )
+                    key = school["schId"] or school["详情页"]
                     if key in seen_school:
                         continue
                     seen_school.add(key)
@@ -636,17 +487,6 @@ def run() -> None:
                     flat_schools.append(school)
 
                 write_partial(flat_schools)
-
-                # Check if there are more pages
-                total_pages = get_total_pages(page)
-                print(f"[INFO] Detected total pages: {total_pages}")
-
-                if page_no >= total_pages or page_no >= max_pages:
-                    break
-
-                # Try next page
-                start_page += 20
-                page_no += 1
 
             save_debug(page, "02_done")
 
